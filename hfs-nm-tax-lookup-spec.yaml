@@ -1,0 +1,133 @@
+meta:
+  name: hfs-nm-tax-lookup
+  display_name: HFS NM Tax Lookup
+  customer: HFS (Health & Fitness Solutions)
+  description: >
+    On shipment.status.updated (delivered), looks up the New Mexico Gross
+    Receipts Tax rate from a Postgres RDS table (nm_tax_rates) using the
+    origin stop's city or NM Tax Code (county code) custom field. Calculates
+    tax as a percentage of all carrier charges and appends an NM Tax charge
+    line item to the carrier financials (vendor/carrier side).
+  script_name: "HFS NM Tax Lookup"   # must match QUEUE_ROUTING key in shipwell-webhook
+
+trigger:
+  events:
+    - shipment.carrier_assigned
+    - shipment.charge_line_item.created
+    - shipment.charge_line_item.updated
+  loop_guard: none                    # write goes to carrier assignment, not shipment fields — no self-update loop
+  note: >-
+    Tax is applied/refreshed on any of the above events so the charge stays
+    accurate through settlement. A pre-existing TTS charge is removed before
+    recalculation to prevent compounding.
+
+data_sources:
+  shipwell_api:
+    fetch: full_shipment
+    via: details.self_link
+  google_sheets:
+    purpose: NM Gross Receipts Tax rate lookup
+    spreadsheet_id: 1Z6aOdmCri_q9UfVxPmg5lZYxl4pjg3I2kJ-uT9rhzmk
+    range: "NM Tax Rates!A:E"
+    service_account_secret: hfs-create-shipment-from-order/google-service-account
+    columns:
+      A: city                         # origin city name (uppercase), primary lookup key
+      B: county_code                  # NM county code (e.g. "001"), fallback lookup key
+      C: municipality_or_county       # human-readable name (not used for lookup)
+      D: location_code                # e.g. "02-100" (not used for lookup)
+      E: rate                         # tax rate as percentage string, e.g. "7.63%"
+    lookup_logic:
+      step1: match (UPPER(city), county_code) combined key -- avoids ambiguity when
+             same city name appears in multiple counties
+      step2: if no result -- match county_code against col B only (NOT city column)
+      caching: in-memory dict loaded on first Lambda invocation, reused for warm calls
+      no_result: log WARN and exit cleanly
+
+custom_fields:
+  nm_tax_code_field:
+    entity: shipment_stop
+    uuid_source: custom_data.custom_fields.nm_tax_code_field_id
+    note: "Previously hardcoded as 'f8f7d6da-db54-48b0-aa19-79b2e2909875' in sandbox — now injected via webhook custom_data"
+
+business_logic:
+  steps:
+    1: "Filter: skip if new_data.status != 'delivered'"
+    2: "Fetch full shipment via details.self_link"
+    3: "Validate carrier assigned (relationship_to_vendor exists)"
+    4: "Validate customer relationship exists (relationship_to_customer exists)"
+    5: "Validate carrier charges > 0 (relationship_to_vendor.customer_charge_line_items)"
+    6: "Find origin/pickup stop (is_pickup=true)"
+    7: "Validate origin stop has location.address"
+    8: "Extract city = originStop.location.address.city (uppercase)"
+    9: "Extract county_code from originStop.custom_data.shipwell_custom_data.shipment_stop[nm_tax_code_field_id]"
+    10: "Query RDS nm_tax_rates: lookup by city first, fallback to county_code"
+    11: "If no tax rate found: log WARN and exit cleanly (no error)"
+    12: "Sum all relationship_to_vendor.customer_charge_line_items[].amount"
+    13: "tax_amount = round(sum * tax_rate, 2)"
+    14: "Build NM Tax charge line item: unit_name='New Mexico Gross Receipts Tax', charge_code='TTS', category='TAX', amount=tax_amount"
+    15: "PUT carrier assignment: customer_charge_line_items = original charges + tax charge; vendor_charge_line_items = []"
+
+validation_guards:
+  - no carrier (relationship_to_vendor is None): log WARN, return
+  - no customer (relationship_to_customer is None): log WARN, return
+  - no carrier charges: log WARN, return
+  - no pickup stop: log WARN, return
+  - no origin address: log WARN, return
+  - city and county_code both missing: log WARN, return
+  - no tax rate found in RDS: log WARN, return
+
+error_handling:
+  rds_connection_error: raise → SQS retry (up to 3x via DLQ redrive) → DLQ
+  api_5xx: raise → SQS retry → DLQ
+  api_4xx: log ERROR, return (no retry)
+  unhandled_exception: raise → SQS retry → DLQ
+
+infrastructure:
+  lambda_name: hfs-nm-tax-lookup
+  runtime: python3.12
+  handler: handler.lambda_handler
+  timeout: 60
+  memory_mb: 256
+  region: us-west-2
+  account: "997233416332"
+  role: arn:aws:iam::997233416332:role/openclaw-lambda-execution-role
+  queue: hfs-nm-tax-lookup.fifo
+  dlq: hfs-nm-tax-lookup-dlq.fifo
+  batch_size: 1
+  function_response_types: [ReportBatchItemFailures]
+  environment_variables:
+    DRY_RUN: "true"
+    GOOGLE_SERVICE_ACCOUNT_SECRET_NAME: hfs-create-shipment-from-order/google-service-account
+    GOOGLE_SERVICE_ACCOUNT_SECRET_REGION: us-west-2
+    NM_TAX_SHEET_ID: 1Z6aOdmCri_q9UfVxPmg5lZYxl4pjg3I2kJ-uT9rhzmk
+    NM_TAX_SHEET_RANGE: "NM Tax Rates!A:E"
+  dependencies:
+    - requests
+    - google-auth
+    - google-auth-httplib2
+
+webhook:
+  new_registration: true
+  endpoint: https://rx7gy7p5z2.execute-api.us-west-2.amazonaws.com/webhook
+  event_names:
+    - shipment.status.updated
+  custom_data:
+    name: "HFS NM Tax Lookup"
+    token: "<hfs_dev_api_token>"
+    custom_fields:
+      nm_tax_code_field_id: "f8f7d6da-db54-48b0-aa19-79b2e2909875"   # sandbox UUID; update per env
+
+shipwell_webhook_fanout:
+  update_shipwell_webhook_lambda: true
+  queue_routing_key: "HFS NM Tax Lookup"
+  env_var_name: QUEUE_HFS_NM_TAX
+  queue_url: https://sqs.us-west-2.amazonaws.com/997233416332/hfs-nm-tax-lookup.fifo
+
+google_sheets_setup:
+  note: >
+    No setup required. The sheet is already shared with
+    hfs-shipwell-lambda@hfsinclair.iam.gserviceaccount.com (the same service account
+    used by hfs-create-shipment-from-order). The Lambda reads the sheet read-only
+    on cold start and caches the parsed rate table in memory for the container lifetime.
+    To update rates, edit the Google Sheet directly — the next cold start will pick up changes.
+  spreadsheet_url: https://docs.google.com/spreadsheets/d/1Z6aOdmCri_q9UfVxPmg5lZYxl4pjg3I2kJ-uT9rhzmk/edit
