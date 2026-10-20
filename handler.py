@@ -842,6 +842,59 @@ def process_webhook(payload: dict) -> None:
                 f"with NM Tax charge {tax_amount}"
             )
 
+            # ── Post-PUT verification + re-apply (Change 2) ───────────────────
+            # hfs-order-update may fire within milliseconds of this PUT in response
+            # to the charge_line_item.created webhook Shipwell emits.  Even with the
+            # NM-tax guard in hfs-order-update, there is a narrow window where an
+            # in-flight invocation (already past the guard check) can overwrite TTS.
+            # Wait 3 seconds then re-fetch the assignment and re-apply TTS if it is
+            # missing.  A single retry is sufficient — hfs-order-update invocations
+            # complete within ~2 seconds.
+            try:
+                time.sleep(3)
+                _verify_assignment = shipwell_request(
+                    token,
+                    f"{base_url}/v2/shipments/{sid}/carrier-assignments/{assignment_id}/",
+                )
+                _verify_charges = (_verify_assignment or {}).get("customer_charge_line_items") or []
+                _tts_present = any(
+                    (c.get("charge_code") or "").upper() == NM_TAX_CHARGE_CODE
+                    for c in _verify_charges
+                )
+                if not _tts_present:
+                    logger.warning(
+                        f"Post-PUT verification: TTS charge missing on {sid} — "
+                        f"re-applying (likely overwritten by concurrent hfs-order-update)"
+                    )
+                    # Rebuild charge list from current state + TTS
+                    _reapply_base = [
+                        c for c in _verify_charges
+                        if (c.get("charge_code") or "").upper() != NM_TAX_CHARGE_CODE
+                    ]
+                    _reapply_body = dict(updated_assignment)
+                    _reapply_body["customer_charge_line_items"] = _reapply_base + [nm_tax_charge]
+                    _reapply_body["vendor_charge_line_items"] = filter_vendor_charge_lines(
+                        _reapply_body["customer_charge_line_items"]
+                    )
+                    shipwell_request(token, put_url, "PUT", _reapply_body)
+                    logger.info(
+                        f"Re-applied NM Tax charge ${tax_amount:.2f} to {sid} "
+                        f"after post-PUT verification detected overwrite"
+                    )
+                    sw.log(
+                        "WARN",
+                        f"TTS overwrite detected on {sid} — re-applied ${tax_amount:.2f} "
+                        f"(race-condition recovery)",
+                    )
+                else:
+                    logger.info(
+                        f"Post-PUT verification: TTS charge confirmed present on {sid}"
+                    )
+            except Exception as _verify_err:
+                logger.warning(
+                    f"Post-PUT verification failed (non-fatal) for {sid}: {_verify_err}"
+                )
+
         outcome = (
             f"Applied NM Tax charge ${tax_amount:.2f} "
             f"(rate={tax_rate}, total_charges={total_charges:.2f}) "
