@@ -84,7 +84,7 @@ _tax_by_county_code: dict[str, float]             | None = None
 # carrier_assigned is the primary trigger. Charges are added by Shipwell a few
 # seconds after assignment, so we poll briefly before giving up.
 # charge_line_item events handle cases where charges are updated after assignment.
-# The self-loop guard prevents infinite loops from our own TTS writes.
+# Loops from our own TTS writes are prevented by the TTS early-skip and the de-dupe guard.
 TRIGGER_EVENTS = frozenset([
     "shipment.carrier_assigned",
     "shipment.charge_line_item.created",
@@ -94,6 +94,7 @@ TRIGGER_EVENTS = frozenset([
 ])
 
 NM_TAX_CHARGE_CODE = "TTS"
+NM_STATE_CODES = frozenset(["NM", "NEW MEXICO"])
 
 
 def _load_service_account_info() -> dict:
@@ -440,13 +441,14 @@ def process_webhook(payload: dict) -> None:
         logger.info(f"Skipping - event {event_name!r} not in trigger set")
         return
 
-    # Loop guard: skip charge_line_item events triggered by the API user (i.e. us).
-    # carrier_assigned is always processed regardless of source user.
-    api_user_id = custom_data.get("api_user_id", "")
-    source_user_id = (payload.get("source") or {}).get("user_id", "")
-    if api_user_id and source_user_id == api_user_id and "charge_line_item" in event_name:
-        logger.info("Skipping - charge_line_item event triggered by API user (self-loop guard)")
-        return
+    # NOTE: there is intentionally no blanket "skip events from the API user" guard.
+    # After a re-rate (hfs-order-update zeroes all charges, incl. TTS, then Shipwell
+    # regenerates contract charges), the regenerated charge_line_item events are
+    # attributed to the API user. Dropping them left the shipment with no NM tax when
+    # charges arrived after the carrier_assigned poll/requeue window closed.
+    # Loops are prevented by (a) the TTS early-skip below, which drops events for our
+    # own tax charge, and (b) the de-dupe guard further down, which returns without
+    # writing when TTS already exists with the correct amount.
 
     # Pre-invocation de-dupe: if this is a charge_line_item event for our own NM tax
     # charge (TTS), skip before creating a Script Lab invocation record. This prevents
@@ -559,6 +561,20 @@ def process_webhook(payload: dict) -> None:
             logger.warning(msg)
             return
 
+        # --- Scope: NM tax applies only when ALL stops are in New Mexico ---
+        # Checked before charge polling so out-of-state shipments exit immediately
+        # (no wasted polling or requeues). A stop with no state is treated as not NM.
+        _stop_states = []
+        for _s in (shipment.get("stops") or []):
+            _addr = (_s.get("location") or {}).get("address") or {}
+            _stop_states.append((_addr.get("state_province") or _addr.get("state") or "").strip().upper())
+        if not _stop_states or any(_st not in NM_STATE_CODES for _st in _stop_states):
+            logger.info(
+                f"Skipping - shipment {sid} is not entirely within New Mexico "
+                f"(stop states={_stop_states}); NM tax not applicable"
+            )
+            return
+
         # ── Validate carrier charges (poll briefly on carrier_assigned to allow charges to settle) ──
         carrier_charges = []
         charges_settled = (payload.get("custom_data") or {}).get("charges_settled", False)
@@ -589,6 +605,7 @@ def process_webhook(payload: dict) -> None:
         if not carrier_charges:
             msg = f"Shipment {sid} has no carrier charge line items after {max_attempts} attempts — skipping"
             logger.warning(msg)
+            _requeue_waiting_for_charges(payload, sid)
             return
 
         # ── Find pickup stop ──────────────────────────────────────────────────
@@ -918,13 +935,54 @@ def process_webhook(payload: dict) -> None:
 # SQS entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+_CURRENT_QUEUE_URL: str = ""
+_MAX_CHARGE_REQUEUES = 3
+
+
+def _requeue_waiting_for_charges(payload: dict, sid: str) -> None:
+    """Fallback: carrier charges had not settled within the poll window.
+
+    Re-send the same payload to this FIFO queue (bounded retries) so the run is
+    retried instead of silently leaving the shipment without NM tax.
+    """
+    try:
+        cd = dict(payload.get("custom_data") or {})
+        retry = int(cd.get("nm_tax_charge_requeue", 0))
+        if retry >= _MAX_CHARGE_REQUEUES:
+            logger.warning(f"Shipment {sid}: no carrier charges after {retry} requeues — giving up")
+            return
+        if not _CURRENT_QUEUE_URL:
+            logger.warning(f"Shipment {sid}: queue URL unknown — cannot requeue")
+            return
+        cd["nm_tax_charge_requeue"] = retry + 1
+        cd["charges_settled"] = True
+        new_payload = dict(payload)
+        new_payload["custom_data"] = cd
+        import hashlib as _h
+        import time as _t
+        boto3.client("sqs", region_name="us-west-2").send_message(
+            QueueUrl=_CURRENT_QUEUE_URL,
+            MessageBody=json.dumps(new_payload),
+            MessageGroupId=_h.md5(f"nm-tax|{sid}".encode()).hexdigest(),
+            MessageDeduplicationId=_h.md5(f"nm-tax-requeue-{sid}-{retry + 1}-{_t.time()}".encode()).hexdigest(),
+        )
+        logger.info(f"Shipment {sid}: requeued NM tax run ({retry + 1}/{_MAX_CHARGE_REQUEUES}) waiting for carrier charges")
+    except Exception as exc:
+        logger.warning(f"Shipment {sid}: failed to requeue NM tax run: {exc}")
+
+
 def lambda_handler(event: dict, context) -> None:
     """
     Triggered by SQS FIFO. Each record is an independent webhook payload.
     Re-raises on unhandled failure so SQS retries (up to 3x) before DLQ.
     """
+    global _CURRENT_QUEUE_URL
     for record in event.get("Records", []):
         try:
+            _arn = record.get("eventSourceARN", "")
+            if _arn.startswith("arn:aws:sqs:"):
+                _, _, _, _region, _acct, _qname = _arn.split(":", 5)
+                _CURRENT_QUEUE_URL = f"https://sqs.{_region}.amazonaws.com/{_acct}/{_qname}"
             payload = json.loads(record["body"])
             process_webhook(payload)
         except Exception as exc:
