@@ -427,6 +427,42 @@ def lookup_tax_rate(city: str | None, county_code: str | None) -> float | None:
 # Core processing
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _remove_nm_tax_charge(token, base_url, sid, assignment_id, rel_vendor, rel_customer, sw, ledger) -> bool:
+    """Remove an existing TTS charge from the carrier assignment. Returns True if removed.
+
+    Re-fetches the assignment right before the PUT so concurrently written charges
+    (e.g. preplanned accessorials) are preserved. No-op when TTS is not present.
+    """
+    put_url = f"{base_url}/v2/shipments/{sid}/carrier-assignments/{assignment_id}/"
+    current = shipwell_request(token, put_url) or {}
+    charges = current.get("customer_charge_line_items") or []
+    kept = [c for c in charges if (c.get("charge_code") or "").upper() != NM_TAX_CHARGE_CODE]
+    if len(kept) == len(charges):
+        return False
+    vendor_info = (rel_vendor or {}).get("customer") or {}
+    customer_info = (rel_customer or {}).get("customer") or {}
+    body = {
+        "vendor": {
+            "name": vendor_info.get("name", ""),
+            "primary_email": vendor_info.get("primary_email", ""),
+        },
+        "customer": {
+            "name": customer_info.get("name", ""),
+            "primary_email": customer_info.get("primary_email", ""),
+        },
+        "customer_charge_line_items": kept,
+        "vendor_charge_line_items": filter_vendor_charge_lines(kept),
+    }
+    sw.start()
+    if DRY_RUN:
+        ledger.record("remove_nm_tax_charge", shipment_id=sid, assignment_id=assignment_id, url=put_url, remaining_charges=len(kept))
+        logger.info(f"[DRY_RUN] Would remove {NM_TAX_CHARGE_CODE} from {sid} (shipment no longer entirely in NM)")
+    else:
+        shipwell_request(token, put_url, "PUT", body)
+        logger.info(f"Removed {NM_TAX_CHARGE_CODE} from {sid}: shipment is no longer entirely within New Mexico")
+    return True
+
+
 def process_webhook(payload: dict) -> None:
     """Main processing logic for a single webhook event."""
 
@@ -572,6 +608,12 @@ def process_webhook(payload: dict) -> None:
             logger.info(
                 f"Skipping - shipment {sid} is not entirely within New Mexico "
                 f"(stop states={_stop_states}); NM tax not applicable"
+            )
+            # A stop change can move a shipment out of NM after TTS was already written.
+            # This lambda is the only writer of TTS, so it also removes it.
+            _remove_nm_tax_charge(
+                token=token, base_url=base_url, sid=sid, assignment_id=assignment_id,
+                rel_vendor=rel_vendor, rel_customer=rel_customer, sw=sw, ledger=ledger,
             )
             return
 
